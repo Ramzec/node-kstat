@@ -24,11 +24,13 @@ protected:
 	    string *name, int instance);
 	Handle<Value> error(const char *fmt, ...);
 	Handle<Value> read(kstat_t *);
+	kstat_named_t* write(char *, Handle<Value>&);
 	int update();
 	~KStatReader();
 
 	static Handle<Value> New(const Arguments& args);
 	static Handle<Value> Read(const Arguments& args);
+	static Handle<Value> Write(const Arguments& args);
 	static Handle<Value> Update(const Arguments& args);
 
 
@@ -114,6 +116,7 @@ KStatReader::Initialize(Handle<Object> target)
 	templ->SetClassName(String::NewSymbol("Reader"));
 
 	NODE_SET_PROTOTYPE_METHOD(templ, "read", KStatReader::Read);
+	NODE_SET_PROTOTYPE_METHOD(templ, "write", KStatReader::Write);
 
 	target->Set(String::NewSymbol("Reader"), templ->GetFunction());
 }
@@ -315,7 +318,7 @@ Handle<Value>
 KStatReader::Read(const Arguments& args)
 {
 	KStatReader *k = ObjectWrap::Unwrap<KStatReader>(args.Holder());
-	Handle<Array> rval;
+	Handle<Object> rval = Object::New();
 	HandleScope scope;
 	int i;
 
@@ -330,6 +333,70 @@ KStatReader::Read(const Arguments& args)
 	} catch (Handle<Value> err) {
 		return (err);
 	}
+
+	return (rval);
+}
+
+kstat_named_t*
+KStatReader::write(char *name, Handle<Value> &value)
+{
+	kstat_t *ksp;
+	kstat_named_t *knp;
+
+	ksp = kstat_lookup(ksr_ctl, (char*)ksr_module->c_str(), ksr_instance,
+			   (char*)ksr_name->c_str());
+	if (!ksp)
+		return NULL;
+
+	if (kstat_read(ksr_ctl, ksp, NULL) == -1)
+		return NULL;
+
+	knp = (kstat_named_t *) kstat_data_lookup(ksp, name);
+	if (!knp)
+		return NULL;
+
+	if (value->IsUint32()) {
+		knp->value.ui32 = value->Uint32Value();
+	} else if (value->IsInt32()) {
+		knp->value.i32 = value->Int32Value();
+	} else if (value->IsNumber()) {
+		knp->value.ui64 = value->NumberValue();
+	} else if (value->IsString()) {
+		String::Utf8Value str(value->ToString());
+
+		KSTAT_NAMED_STR_PTR(knp) = (char*)KSTAT_NAMED_PTR(ksp) +
+		    ksp->ks_ndata * sizeof(kstat_named_t);
+		KSTAT_NAMED_STR_BUFLEN(knp) = str.length() + 1;
+		strcpy(KSTAT_NAMED_STR_PTR(knp), (char *)*str);
+	}
+
+	if (kstat_write(ksr_ctl, ksp, NULL) == -1) {
+		return NULL;
+	}
+
+	return knp;
+}
+
+Handle<Value>
+KStatReader::Write(const Arguments& args)
+{
+	KStatReader *k = ObjectWrap::Unwrap<KStatReader>(args.Holder());
+	Handle<Object> rval = Object::New();
+	HandleScope scope;
+	kstat_t *ksp;
+	kstat_named_t *knp;
+
+	if (args.Length() < 2 || !args[0]->IsString())
+		return (k->error("first argument must be string"));
+	String::Utf8Value name(args[0]->ToString());
+
+	if (args.Length() < 2)
+		return (k->error("second argument is not specified"));
+
+	Handle<Value> value = args[1];
+	knp = k->write(*name, value);
+	if (knp == NULL)
+		return (k->error("can't write kstat"));
 
 	return (rval);
 }
