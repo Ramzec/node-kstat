@@ -229,7 +229,9 @@ KStatReader::data_named(kstat_t *ksp)
 			break;
 
 		case KSTAT_DATA_STRING:
-			val = String::New(KSTAT_NAMED_STR_PTR(nm));
+			/* actually STR_PTR can be NULL and this is normal */
+			val = String::New(KSTAT_NAMED_STR_PTR(nm) ?
+			    KSTAT_NAMED_STR_PTR(nm) : "");
 			break;
 
 		default:
