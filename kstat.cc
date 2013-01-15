@@ -20,11 +20,18 @@ public:
 protected:
 	static Persistent<FunctionTemplate> templ;
 
+	typedef struct {
+		int data_type;
+		uint32_t value_ui32;
+		uint64_t value_ui64;
+		string value_str;
+	} write_value_t;
+
 	KStatReader(string *module, string *classname,
 	    string *name, int instance);
 	Handle<Value> error(const char *fmt, ...);
 	Handle<Value> read(kstat_t *);
-	kstat_named_t* write(char *, Handle<Value>&);
+	kstat_named_t* write(char *, write_value_t *);
 	int update();
 	~KStatReader();
 
@@ -32,7 +39,17 @@ protected:
 	static Handle<Value> Read(const Arguments& args);
 	static Handle<Value> Write(const Arguments& args);
 	static Handle<Value> Update(const Arguments& args);
+	static void EIO_Write(eio_req *req);
+	static int EIO_AfterWrite(eio_req *req);
+	static Handle<Value> WriteAsync(const Arguments& args);
 
+	typedef struct {
+		KStatReader *k;
+		Persistent<Function> cb;
+		string name;
+		write_value_t val;
+		string error;
+	} write_baton_t;
 
 private:
 	static string *stringMember(Local<Value>, char *, char *);
@@ -117,6 +134,7 @@ KStatReader::Initialize(Handle<Object> target)
 
 	NODE_SET_PROTOTYPE_METHOD(templ, "read", KStatReader::Read);
 	NODE_SET_PROTOTYPE_METHOD(templ, "write", KStatReader::Write);
+	NODE_SET_PROTOTYPE_METHOD(templ, "writeAsync", KStatReader::WriteAsync);
 
 	target->Set(String::NewSymbol("Reader"), templ->GetFunction());
 }
@@ -340,7 +358,7 @@ KStatReader::Read(const Arguments& args)
 }
 
 kstat_named_t*
-KStatReader::write(char *name, Handle<Value> &value)
+KStatReader::write(char *name, write_value_t *val)
 {
 	kstat_t *ksp;
 	kstat_named_t *knp;
@@ -357,19 +375,16 @@ KStatReader::write(char *name, Handle<Value> &value)
 	if (!knp)
 		return NULL;
 
-	if (value->IsUint32()) {
-		knp->value.ui32 = value->Uint32Value();
-	} else if (value->IsInt32()) {
-		knp->value.i32 = value->Int32Value();
-	} else if (value->IsNumber()) {
-		knp->value.ui64 = value->NumberValue();
-	} else if (value->IsString()) {
-		String::Utf8Value str(value->ToString());
-
+	if (val->data_type == KSTAT_DATA_UINT32) {
+		knp->value.ui32 = val->value_ui32;
+	} else if (val->data_type == KSTAT_DATA_UINT64) {
+		knp->value.ui64 = val->value_ui64;
+	} else if (val->data_type == KSTAT_DATA_STRING) {
 		KSTAT_NAMED_STR_PTR(knp) = (char*)KSTAT_NAMED_PTR(ksp) +
 		    ksp->ks_ndata * sizeof(kstat_named_t);
-		KSTAT_NAMED_STR_BUFLEN(knp) = str.length() + 1;
-		strcpy(KSTAT_NAMED_STR_PTR(knp), (char *)*str);
+		KSTAT_NAMED_STR_BUFLEN(knp) = val->value_str.length() + 1;
+		strcpy(KSTAT_NAMED_STR_PTR(knp),
+		    (char *)val->value_str.c_str());
 	}
 
 	if (kstat_write(ksr_ctl, ksp, NULL) == -1) {
@@ -385,7 +400,6 @@ KStatReader::Write(const Arguments& args)
 	KStatReader *k = ObjectWrap::Unwrap<KStatReader>(args.Holder());
 	Handle<Object> rval = Object::New();
 	HandleScope scope;
-	kstat_t *ksp;
 	kstat_named_t *knp;
 
 	if (args.Length() < 2 || !args[0]->IsString())
@@ -395,16 +409,111 @@ KStatReader::Write(const Arguments& args)
 	if (args.Length() < 2)
 		return (k->error("second argument is not specified"));
 
-	Handle<Value> value = args[1];
-	knp = k->write(*name, value);
+	write_value_t val;
+	Local<Value> value = args[1];
+	if (value->IsUint32()) {
+		val.data_type = KSTAT_DATA_UINT32;
+		val.value_ui32 = value->Uint32Value();
+	} else if (value->IsNumber()) {
+		val.data_type = KSTAT_DATA_UINT64;
+		val.value_ui64 = value->NumberValue();
+	} else if (value->IsString()) {
+		String::Utf8Value str(value->ToString());
+		val.data_type = KSTAT_DATA_STRING;
+		val.value_str = *str;
+	}
+	knp = k->write(*name, &val);
 	if (knp == NULL)
 		return (k->error("can't write kstat"));
 
 	return (rval);
 }
 
+void
+KStatReader::EIO_Write(eio_req *req)
+{
+	write_baton_t *baton = static_cast<write_baton_t *>(req->data);
+	kstat_named_t *knp;
+
+	knp = baton->k->write((char*)baton->name.c_str(), &baton->val);
+	if (knp == NULL)
+		baton->error = strerror(errno);
+}
+
+int
+KStatReader::EIO_AfterWrite(eio_req *req)
+{
+	HandleScope scope;
+	write_baton_t *baton = static_cast<write_baton_t *>(req->data);
+	ev_unref(EV_DEFAULT_UC);
+	baton->k->Unref();
+	Local<Value> argv[1];
+
+	if (!baton->error.empty()) {
+		Local<Value> err =
+		    Exception::Error(String::New(baton->error.c_str()));
+		argv[0] = err;
+	} else {
+		argv[0] = Local<Value>::New(Null());
+	}
+
+	TryCatch try_catch;
+	baton->cb->Call(Context::GetCurrent()->Global(), 1, argv);
+	if (try_catch.HasCaught()) {
+		node::FatalException(try_catch);
+	}
+
+	baton->cb.Dispose();
+	delete baton;
+	return 0;
+}
+
+Handle<Value>
+KStatReader::WriteAsync(const Arguments& args)
+{
+	KStatReader *k = ObjectWrap::Unwrap<KStatReader>(args.Holder());
+	Handle<Object> rval = Object::New();
+	HandleScope scope;
+
+	if (args.Length() < 3)
+		return (k->error("expecting 3 arguments"));
+
+	if (!args[0]->IsString())
+		return (k->error("first argument must be string"));
+	String::Utf8Value name(args[0]->ToString());
+	Local<Value> value = args[1];
+
+	if (!args[2]->IsFunction())
+		return (k->error("third argument is not function"));
+	Local<Function> cb = Local<Function>::Cast(args[2]);
+
+	write_baton_t *baton = new write_baton_t();
+	baton->k = k;
+	baton->cb = Persistent<Function>::New(cb);
+	baton->name = *name;
+
+	if (value->IsUint32()) {
+		baton->val.data_type = KSTAT_DATA_UINT32;
+		baton->val.value_ui32 = value->Uint32Value();
+	} else if (value->IsNumber()) {
+		baton->val.data_type = KSTAT_DATA_UINT64;
+		baton->val.value_ui64 = value->NumberValue();
+	} else if (value->IsString()) {
+		String::Utf8Value str(value->ToString());
+		baton->val.data_type = KSTAT_DATA_STRING;
+		baton->val.value_str = *str;
+	}
+
+	k->Ref();
+
+	eio_custom(EIO_Write, EIO_PRI_DEFAULT, EIO_AfterWrite, baton);
+	ev_ref(EV_DEFAULT_UC);
+
+	return (rval);
+}
+
 extern "C" void
-init (Handle<Object> target) 
+init (Handle<Object> target)
 {
 	KStatReader::Initialize(target);
 }
