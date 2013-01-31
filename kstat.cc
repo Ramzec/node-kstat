@@ -227,7 +227,9 @@ KStatReader::data_named(kstat_t *ksp)
 
 		switch (nm->data_type) {
 		case KSTAT_DATA_CHAR:
-			val = Number::New(nm->value.c[0]);
+			/* must protect string ending */
+			nm->value.c[15] = '\0';
+			val = String::New(nm->value.c);
 			break;
 
 		case KSTAT_DATA_INT32:
