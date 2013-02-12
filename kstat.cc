@@ -39,8 +39,8 @@ protected:
 	static Handle<Value> Read(const Arguments& args);
 	static Handle<Value> Write(const Arguments& args);
 	static Handle<Value> Update(const Arguments& args);
-	static void EIO_Write(eio_req *req);
-	static int EIO_AfterWrite(eio_req *req);
+	static void EIO_Write(uv_work_t *req);
+	static void EIO_AfterWrite(uv_work_t *req);
 	static Handle<Value> WriteAsync(const Arguments& args);
 
 	typedef struct {
@@ -432,7 +432,7 @@ KStatReader::Write(const Arguments& args)
 }
 
 void
-KStatReader::EIO_Write(eio_req *req)
+KStatReader::EIO_Write(uv_work_t *req)
 {
 	write_baton_t *baton = static_cast<write_baton_t *>(req->data);
 	kstat_named_t *knp;
@@ -442,12 +442,12 @@ KStatReader::EIO_Write(eio_req *req)
 		baton->error = strerror(errno);
 }
 
-int
-KStatReader::EIO_AfterWrite(eio_req *req)
+void
+KStatReader::EIO_AfterWrite(uv_work_t *req)
 {
 	HandleScope scope;
 	write_baton_t *baton = static_cast<write_baton_t *>(req->data);
-	ev_unref(EV_DEFAULT_UC);
+	uv_unref((uv_handle_t *) req);
 	baton->k->Unref();
 	Local<Value> argv[1];
 
@@ -467,14 +467,13 @@ KStatReader::EIO_AfterWrite(eio_req *req)
 
 	baton->cb.Dispose();
 	delete baton;
-	return 0;
+    delete req;
 }
 
 Handle<Value>
 KStatReader::WriteAsync(const Arguments& args)
 {
 	KStatReader *k = ObjectWrap::Unwrap<KStatReader>(args.Holder());
-	Handle<Object> rval = Object::New();
 	HandleScope scope;
 
 	if (args.Length() < 3)
@@ -508,10 +507,12 @@ KStatReader::WriteAsync(const Arguments& args)
 
 	k->Ref();
 
-	eio_custom(EIO_Write, EIO_PRI_DEFAULT, EIO_AfterWrite, baton);
-	ev_ref(EV_DEFAULT_UC);
+    uv_work_t *req = new uv_work_t;
+    req->data = baton;
+    uv_queue_work(uv_default_loop(), req, EIO_Write, EIO_AfterWrite);
+    uv_ref((uv_handle_t*) &req);
 
-	return (rval);
+	return Undefined();
 }
 
 extern "C" void
